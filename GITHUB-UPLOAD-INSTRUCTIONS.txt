@@ -1,0 +1,16 @@
+GRANDBOARD CHESS - GITHUB QUICK START
+
+1. Extract Grandboard-Chess-GitHub-Ready.zip.
+2. At https://github.com/new, create a Public repo called grandboard-chess.
+3. In the new repo, choose 'uploading an existing file' or Add file > Upload files.
+4. Upload the files INSIDE the extracted folder (index.html, app.js, chess-core.js, style.css, README.md).
+5. Commit changes.
+6. Go to Settings > Pages > Build and deployment > Source: Deploy from a branch.
+7. Branch: main; folder: /(root); Save.
+8. Open https://YOUR-USERNAME.github.io/grandboard-chess/ after publishing.
+
+No need to upload the ZIP itself to GitHub: upload the extracted files.
+
+To play locally now: open index.html (or download the separate Grandboard-Chess-Play.html and double-click it).
+
+Games saved in your browser won't automatically sync across devices. Strongest AI requires a network-connected Stockfish engine; a built-in fallback works offline.
