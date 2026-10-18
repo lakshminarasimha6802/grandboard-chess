@@ -1,4 +1,4 @@
-/* Grandboard · playable offline with local AI; Stockfish 19 loads when internet is available. */
+/* Grandboard Chess · mobile engine fix · Stockfish 19 plus local fallback. */
 (() => {
 'use strict';
 const $=id=>document.getElementById(id);
@@ -152,36 +152,116 @@ function downloadPGN(){
  const url=URL.createObjectURL(new Blob([pgn],{type:'application/x-chess-pgn'}));
  const a=document.createElement('a');a.href=url;a.download=`game-${game.id}.pgn`;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1500);
 }
-/* Stockfish 19 on an external CDN, with a local JS search fallback if blocked or offline. */
-class StockfishBridge{
- constructor(){this.ready=false;this.failed=false;this.worker=null;this.inflight=null;this.queue=[];this.started=Date.now();this.load();}
- async load(){
-  let local=false;
-  if(location.protocol==='http:'||location.protocol==='https:'){
-   try{const response=await fetch('./engine/stockfish-19-lite-single.js',{method:'HEAD'});local=response.ok;}catch{}
-  }
-  try{
-   let worker;
-   if(local){worker=new Worker('./engine/stockfish-19-lite-single.js');}
-   else{const source='importScripts(\"https://cdn.jsdelivr.net/npm/stockfish@19.0.0/bin/stockfish-19-asm.js\");';
-    const url=URL.createObjectURL(new Blob([source],{type:'application/javascript'}));worker=new Worker(url);URL.revokeObjectURL(url);}
-   this.worker=worker;this.local=local;worker.onmessage=e=>this.message(String(e.data));worker.onerror=()=>this.fail(true);worker.postMessage('uci');
-   setTimeout(()=>{if(!this.ready)this.fail(true);},14000);
-  }catch{this.fail(true);}
+/* Stockfish 19 Lite if hosted locally, otherwise try online Stockfish 19 ASM. */
+class StockfishBridge {
+ constructor(){
+  this.ready=false;this.failed=false;this.worker=null;this.workerURL=null;
+  this.inflight=null;this.queue=[];this.sources=[];this.nextSource=0;
+  this.local=false;this.engineLabel='Stockfish 19';this.started=Date.now();
+  this.init();
  }
- fail(force=false){if(this.failed||this.ready&&!force)return;this.failed=true;this.ready=false;try{this.worker?.terminate();}catch{}this.worker=null;while(this.queue.length)this.queue.shift().resolve(null);if(this.inflight){clearTimeout(this.inflight.timeout);this.inflight.resolve(null);this.inflight=null;}if(game)render();}
- message(line){if(line.includes('uciok')){this.ready=true;this.failed=false;this.worker.postMessage('isready');if(game)render();return;}
-  const m=line.match(/bestmove\s+([a-h][1-8][a-h][1-8][qrbn]?)/);if(m&&this.inflight){const current=this.inflight;this.inflight=null;clearTimeout(current.timeout);current.resolve(m[1]);this.startNext();}}
- bestMove(fen,level){if(!this.ready)return Promise.resolve(null);return new Promise(resolve=>{this.queue.push({fen,level,resolve});this.startNext();});}
- startNext(){if(!this.ready||this.inflight||!this.queue.length)return;const job=this.queue.shift();this.inflight=job;const n=LEVELS[job.level]||LEVELS.senior;
-  if(job.level==='grandmaster'){this.worker.postMessage('setoption name UCI_LimitStrength value false');this.worker.postMessage('setoption name Skill Level value 20');}
-  else{this.worker.postMessage('setoption name UCI_LimitStrength value true');this.worker.postMessage('setoption name UCI_Elo value '+Math.max(1320,parseInt(n.elo.replace(/\D/g,''),10)||1600));this.worker.postMessage('setoption name Skill Level value '+n.skill);}
-  this.worker.postMessage('position fen '+job.fen);this.worker.postMessage('go movetime '+(job.level==='grandmaster'?1600:job.level==='master'?950:450));
-  job.timeout=setTimeout(()=>{if(this.inflight===job){this.inflight=null;job.resolve(null);this.fail(true);}},6500);
+ async init(){
+  // A matching .wasm file must be beside this .js file for local WASM to work.
+  if(location.protocol==='https:'||location.protocol==='http:'){
+   try{
+    const response=await fetch('./engine/stockfish-19-lite-single.js',{method:'HEAD',cache:'no-store'});
+    if(response.ok)this.sources.push({local:true,url:'./engine/stockfish-19-lite-single.js',label:'Stockfish 19 Lite'});
+   }catch(e){console.debug('Local Stockfish engine not installed yet.',e);}
+  }
+  // ASM-JS is one JavaScript file: it needs no companion WASM file.
+  this.sources.push(
+   {url:'https://cdn.jsdelivr.net/npm/stockfish@19.0.1/bin/stockfish-19-asm.js',label:'Stockfish 19'},
+   {url:'https://unpkg.com/stockfish@19.0.1/bin/stockfish-19-asm.js',label:'Stockfish 19 (mirror)'},
+   {url:'https://cdn.jsdelivr.net/npm/stockfish@18.0.8/bin/stockfish-18-asm.js',label:'Stockfish 18 (backup)'}
+  );
+  this.tryNextSource();
+ }
+ stopWorker(){
+  clearTimeout(this.loadTimeout);
+  try{this.worker?.terminate();}catch{}
+  this.worker=null;
+  if(this.workerURL){try{URL.revokeObjectURL(this.workerURL);}catch{}this.workerURL=null;}
+  if(this.inflight){clearTimeout(this.inflight.timeout);this.inflight.resolve(null);this.inflight=null;}
+ }
+ tryNextSource(){
+  this.ready=false;this.stopWorker();
+  if(this.nextSource>=this.sources.length){
+   this.failed=true;while(this.queue.length)this.queue.shift().resolve(null);
+   if(game)render();return;
+  }
+  const source=this.sources[this.nextSource++];
+  this.local=!!source.local;this.engineLabel=source.label;
+  try{
+   if(source.local){this.worker=new Worker(source.url);}
+   else{
+    // A same-origin Blob Worker is allowed to import a classic script from a CDN.
+    const bootstrap='importScripts('+JSON.stringify(source.url)+');';
+    this.workerURL=URL.createObjectURL(new Blob([bootstrap],{type:'text/javascript'}));
+    this.worker=new Worker(this.workerURL);
+   }
+   const active=this.worker;
+   active.onmessage=e=>{if(this.worker===active)this.message(String(e.data));};
+   active.onerror=e=>{if(this.worker!==active)return;console.warn('Stockfish source failed:',source.url,e.message||e);this.tryNextSource();};
+   active.postMessage('uci');
+   // Large files can take longer to load on mobile data.
+   this.loadTimeout=setTimeout(()=>{if(this.worker===active&&!this.ready)this.tryNextSource();},45000);
+   if(game)render();
+  }catch(e){console.warn('Unable to start Stockfish worker:',e);this.tryNextSource();}
+ }
+ message(line){
+  if(line.includes('uciok')){
+   this.ready=true;this.failed=false;clearTimeout(this.loadTimeout);
+   if(this.workerURL){URL.revokeObjectURL(this.workerURL);this.workerURL=null;}
+   this.worker.postMessage('isready');this.startNext();if(game)render();return;
+  }
+  const m=line.match(/bestmove\s+([a-h][1-8][a-h][1-8][qrbn]?)/);
+  if(m&&this.inflight){
+   const current=this.inflight;this.inflight=null;
+   clearTimeout(current.timeout);current.resolve(m[1]);this.startNext();
+  }
+ }
+ waitUntilReady(timeout=12000){
+  if(this.ready||this.failed)return Promise.resolve(this.ready);
+  const until=Date.now()+timeout;
+  return new Promise(resolve=>{
+   const check=()=>{
+    if(this.ready||this.failed||Date.now()>=until)resolve(this.ready);
+    else setTimeout(check,250);
+   };check();
+  });
+ }
+ bestMove(fen,level){
+  if(!this.ready)return Promise.resolve(null);
+  return new Promise(resolve=>{this.queue.push({fen,level,resolve});this.startNext();});
+ }
+ startNext(){
+  if(!this.ready||this.inflight||!this.queue.length)return;
+  const job=this.queue.shift();this.inflight=job;
+  const n=LEVELS[job.level]||LEVELS.senior;
+  try{
+   if(job.level==='grandmaster'){
+    this.worker.postMessage('setoption name UCI_LimitStrength value false');
+    this.worker.postMessage('setoption name Skill Level value 20');
+   }else{
+    this.worker.postMessage('setoption name UCI_LimitStrength value '+(job.level==='beginner'?'false':'true'));
+    this.worker.postMessage('setoption name UCI_Elo value '+Math.max(1320,parseInt(n.elo.replace(/\D/g,''),10)||1600));
+    this.worker.postMessage('setoption name Skill Level value '+n.skill);
+   }
+   this.worker.postMessage('position fen '+job.fen);
+   const ms=job.level==='grandmaster'?4000:job.level==='master'?2400:job.level==='senior'?1200:650;
+   this.worker.postMessage('go movetime '+ms);
+   job.timeout=setTimeout(()=>{
+    if(this.inflight===job){this.inflight=null;job.resolve(null);this.tryNextSource();}
+   },18000);
+  }catch(e){console.warn('Stockfish search failed:',e);job.resolve(null);this.inflight=null;this.tryNextSource();}
  }
 }
 let engine={ready:false,failed:false};
-function engineStatusText(){return engine.ready?(engine.local?'Stockfish 19 WASM · strongest mode':'Stockfish 19 online · powerful AI'):engine.failed?'Offline AI active · weaker than Stockfish':'Connecting to Stockfish… offline AI is ready';}
+function engineStatusText(){
+ if(engine.ready)return `${engine.engineLabel} · strong AI ready`;
+ if(engine.failed)return 'Basic AI active · Stockfish could not load';
+ return 'Connecting to Stockfish… basic AI available';
+}
 function evalState(pos){const w=C.weight;let points=0;for(let i=0;i<64;i++){const p=pos.board[i];if(!p)continue;const side=sidePiece(p),sign=side===pos.turn?1:-1;const row=i>>3,col=i%8,central=3.5-(Math.abs(row-3.5)+Math.abs(col-3.5))/2;
   let bonus=central*(p.toLowerCase()==='n'?8:p.toLowerCase()==='b'?5:2);
   if(p.toLowerCase()==='p')bonus+=((side==='w'?6-row:row-1)*6);
@@ -207,6 +287,7 @@ function localMove(pos,level){let moves=pos.legalMoves();if(!moves.length)return
  return chosen;
 }
 async function bestMoveForCurrent(){if(!game||!position)return null;const p=position.clone(),fen=p.fen(),level=levelFor(p.turn);
+ if(!engine.ready&&!engine.failed&&['senior','master','grandmaster'].includes(level))await engine.waitUntilReady(12000);
  if(engine.ready&&!['beginner','intermediate'].includes(level)){
   const uci=await engine.bestMove(fen,level);
   if(uci){const found=p.legalMoves().find(m=>C.sqname(m.from)+C.sqname(m.to)+(m.promotion||'')===uci);if(found)return{from:C.sqname(found.from),to:C.sqname(found.to),promotion:found.promotion||undefined};}
